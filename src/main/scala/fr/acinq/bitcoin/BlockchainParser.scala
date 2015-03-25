@@ -77,7 +77,7 @@ object BlockchainParser extends App with Logging {
   }
 
   def verif2(tx: Transaction, inputIndex:Int, txOut: TxOut) : Boolean = {
-    val runner = new Runner(Script.Context(tx, inputIndex, txOut.publicKeyScript))
+    val runner = new Runner(Script.Context(tx, inputIndex))
     runner.verifyScripts(tx.txIn(inputIndex).signatureScript, txOut.publicKeyScript)
   }
 
@@ -117,13 +117,15 @@ object BlockchainParser extends App with Logging {
   def processBlock(block: Block): Unit = processBlock(block, false)
 
   @tailrec
-  def readBlocks(input: InputStream, f: Block => Unit, previousHash: Option[Array[Byte]] = None, count: Int = skip) : Unit = {
+  def readBlocks(input: InputStream, f: Block => Unit, previousHash: Option[BinaryData] = None, count: Int = skip) : Unit = {
     if (input.available() > 0) {
       if (count % 10000 == 0) {
         logger.info(s"processed $count blocks and verified $txCount transactions")
         db.commit()
       }
       val block = readBlock(input)
+      val expected:BinaryData = block.header.hashPreviousBlock
+      previousHash.map(h => if (expected != h) logger.warn(s"expected block hash $expected got $h"))
       f(block)
       cursor.put("skip", count)
       readBlocks(input, f, Some(block.hash), count + 1)
