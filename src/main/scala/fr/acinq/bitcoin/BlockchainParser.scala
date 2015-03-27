@@ -1,17 +1,17 @@
 package fr.acinq.bitcoin
 
 import java.io.{File, FileInputStream, ByteArrayInputStream, InputStream}
+import akka.actor.{Props, ActorSystem, ActorLogging, Actor}
 import fr.acinq.bitcoin.Script.Runner
 import org.mapdb._
 import grizzled.slf4j.Logging
 
 import scala.annotation.tailrec
+import scala.collection.mutable.ListBuffer
 import scala.util.{Failure, Success, Try}
 
-/**
- * Created by fabrice on 3/17/2015.
- */
 object BlockchainParser extends App with Logging {
+
   val db = DBMaker.newFileDB(new File("utxo")).closeOnJvmShutdown().make()
   val cursor: HTreeMap[String, Int] = db.getHashMap("cursor")
   val utxos: HTreeMap[String, TxOut] = db.getHashMap("utxos")
@@ -20,6 +20,44 @@ object BlockchainParser extends App with Logging {
   var start = cursor.get("start")
   var skip = cursor.get("skip")
   var flags = 0
+
+  class Processor extends Actor {
+    val orphans = ListBuffer.empty[Block]
+
+    def receive = {
+      case block: Block => {
+        logger.debug(s"received block ${block.hash} -> ${block.header.hashPreviousBlock}")
+        processBlock(block, checkScripts = true)
+        context become running(block.hash)
+      }
+    }
+
+    def findNewTip(tip: BinaryData): BinaryData = orphans.zipWithIndex.find(_._1.header.hashPreviousBlock == tip) match {
+      case None => tip
+      case Some((newBlock, index)) => {
+        orphans.remove(index)
+        logger.debug(s"removing ${newBlock.hash} from orphans")
+        processBlock(newBlock)
+        findNewTip(newBlock.hash)
+      }
+    }
+
+    def running(tip: BinaryData): Receive = {
+      case block: Block if block.header.hashPreviousBlock != tip => {
+        logger.debug(s"tip = ${tip}")
+        logger.debug(s"received orphan block ${block.hash} -> ${block.header.hashPreviousBlock}")
+        orphans += block
+      }
+      case block: Block => {
+        logger.debug(s"tip = ${tip}")
+        logger.debug(s"received block ${block.hash} -> ${block.header.hashPreviousBlock}")
+        processBlock(block, checkScripts = true)
+        val newTip = findNewTip(block.hash)
+        logger.debug(s"orphans size: ${orphans.size}")
+        context become running(newTip)
+      }
+    }
+  }
 
   @tailrec
   def parse(arguments: Seq[String]): Unit = arguments match {
@@ -30,6 +68,9 @@ object BlockchainParser extends App with Logging {
     case "-prefix" :: value :: tail => prefix = value; parse(tail)
   }
 
+  val system = ActorSystem("parser")
+  val processor = system.actorOf(Props[Processor], "processor")
+
   parse(args.toList)
 
   for (i <- start until 226) {
@@ -39,12 +80,12 @@ object BlockchainParser extends App with Logging {
       skip = 0
       db.commit()
     }
-    val filename =  prefix + blockName(i)
+    val filename = prefix + blockName(i)
     logger.info(s"processing $filename")
     val istream = new FileInputStream(filename)
     logger.info(s"skipping $skip blocks")
     skipBlocks(istream, skip)
-    readBlocks(istream, b => processBlock(b, true))
+    readBlocks(istream, b => processor ! b)
     logger.info(s"number of utxos: ${utxos.size}")
   }
 
@@ -71,19 +112,19 @@ object BlockchainParser extends App with Logging {
     Block.read(new ByteArrayInputStream(raw))
   }
 
-  def verif1(tx: Transaction, inputIndex:Int, txOut: TxOut) : Boolean = {
+  def verif1(tx: Transaction, inputIndex: Int, txOut: TxOut): Boolean = {
     val result = ConsensusWrapper.VerifyScript(txOut.publicKeyScript, Transaction.write(tx), inputIndex, flags)
     result == 1
   }
 
-  def verif2(tx: Transaction, inputIndex:Int, txOut: TxOut) : Boolean = {
+  def verif2(tx: Transaction, inputIndex: Int, txOut: TxOut): Boolean = {
     val runner = new Runner(Script.Context(tx, inputIndex))
     runner.verifyScripts(tx.txIn(inputIndex).signatureScript, txOut.publicKeyScript)
   }
 
   var txCount = 0L
 
-  def processTx(tx: Transaction, checkScripts: Boolean = false) : Unit = {
+  def processTx(tx: Transaction, checkScripts: Boolean = false): Unit = {
     val hash = Transaction.hash(tx)
     for (index <- 0 until tx.txOut.length) {
       utxos.put(OutPoint(hash, index).toString, tx.txOut(index))
@@ -114,21 +155,19 @@ object BlockchainParser extends App with Logging {
 
   def processBlock(block: Block, checkScripts: Boolean): Unit = block.tx.map(tx => processTx(tx, checkScripts))
 
-  def processBlock(block: Block): Unit = processBlock(block, false)
+  def processBlock(block: Block): Unit = processBlock(block, true)
 
   @tailrec
-  def readBlocks(input: InputStream, f: Block => Unit, previousHash: Option[BinaryData] = None, count: Int = skip) : Unit = {
+  def readBlocks(input: InputStream, f: Block => Unit, count: Int = skip): Unit = {
     if (input.available() > 0) {
       if (count % 10000 == 0) {
         logger.info(s"processed $count blocks and verified $txCount transactions")
         db.commit()
       }
       val block = readBlock(input)
-      val expected:BinaryData = block.header.hashPreviousBlock
-      previousHash.map(h => if (expected != h) logger.warn(s"expected block hash $expected got $h"))
       f(block)
       cursor.put("skip", count)
-      readBlocks(input, f, Some(block.hash), count + 1)
+      readBlocks(input, f, count + 1)
     }
   }
 }
